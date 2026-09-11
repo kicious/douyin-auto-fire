@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import secrets
 from urllib.parse import urlsplit
@@ -10,6 +11,9 @@ from playwright.async_api import Locator, Page
 from app.douyin import DouyinChat, PageOperationError, first_visible
 from app.models import Message, Sticker
 from app.selectors import IMAGE_INPUTS, MESSAGE_INPUTS, STICKER_BUTTONS, STICKER_PANELS
+
+
+LOGGER = logging.getLogger("douyin_sender")
 
 
 def _monotonic() -> float:
@@ -90,6 +94,18 @@ SEND_PENDING_MARKERS = (
     '[class*="im-saas-message-spin"]',
     '[data-icon="spin"]',
 )
+# Only these selectors identify the retry control on a message that Douyin has
+# explicitly marked as not delivered. Clicking that control is safer than
+# composing the payload again because it retries the existing failed bubble.
+SEND_RETRY_MARKERS = (
+    '[aria-label*="重试"]',
+    '[title*="重试"]',
+    '[class*="ContentSideSendStatusretry"]',
+    '[class*="SendStatusretry"]',
+)
+# Give short-lived network throttling time to clear instead of hammering the
+# retry control. The total remains well inside the workflow's 30 minute limit.
+SEND_RETRY_DELAYS_MS = (10_000, 30_000)
 
 # Overall budget for confirming a single message reaches a terminal state. A
 # stuck spinner past this is treated as failure/uncertain, never success.
@@ -183,7 +199,7 @@ async def send_image(page: Page, image_path: str) -> None:
             timeout=15_000,
         )
         latest = page.locator(LATEST_OUTGOING_MESSAGE).first
-        await _await_send_terminal_state(page, latest, "图片")
+        await _await_send_terminal_state_with_retry(page, latest, "图片")
     except PageOperationError:
         raise
     except Exception as exc:
@@ -316,6 +332,54 @@ async def _marker_visible(scope: Locator, selectors: tuple[str, ...]) -> bool:
     return False
 
 
+async def _click_retry_on_latest_failed_message(page: Page, delay_ms: int = 0) -> bool:
+    """Retry an explicitly failed bubble without composing a duplicate."""
+    latest = page.locator(LATEST_OUTGOING_MESSAGE).first
+    for selector in SEND_RETRY_MARKERS:
+        marker = latest.locator(selector).first
+        try:
+            if not await marker.count() or not await marker.is_visible():
+                continue
+            if delay_ms:
+                await page.wait_for_timeout(delay_ms)
+            # The conversation may have changed while waiting. Only click if
+            # the same latest bubble is still explicitly marked as failed.
+            if await marker.count() and await marker.is_visible():
+                await marker.click(force=True)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _await_send_terminal_state_with_retry(
+    page: Page,
+    scope: Locator,
+    label: str,
+    timeout_ms: int = SEND_CONFIRM_TIMEOUT_MS,
+) -> None:
+    """Confirm delivery, retrying only bubbles Douyin says were not sent."""
+    for attempt in range(len(SEND_RETRY_DELAYS_MS) + 1):
+        try:
+            await _await_send_terminal_state(page, scope, label, timeout_ms)
+            return
+        except PageOperationError as exc:
+            explicit_failure = "页面提示可以重试" in str(exc)
+            if not explicit_failure or attempt >= len(SEND_RETRY_DELAYS_MS):
+                raise
+
+            delay_ms = SEND_RETRY_DELAYS_MS[attempt]
+            LOGGER.warning(
+                "%s发送临时失败，%d 秒后点击原消息重试（%d/%d）",
+                label,
+                delay_ms // 1000,
+                attempt + 1,
+                len(SEND_RETRY_DELAYS_MS),
+            )
+            if not await _click_retry_on_latest_failed_message(page, delay_ms):
+                raise
+
+
 async def _await_send_terminal_state(
     page: Page,
     scope: Locator,
@@ -427,7 +491,7 @@ async def _confirm_outgoing_message(
         # flight or have already failed. Wait for a real terminal state rather
         # than treating a visible bubble as success (Issue #11).
         latest = page.locator(LATEST_OUTGOING_MESSAGE).first
-        await _await_send_terminal_state(page, latest, label)
+        await _await_send_terminal_state_with_retry(page, latest, label)
     except PageOperationError:
         raise
     except Exception as exc:

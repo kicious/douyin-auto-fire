@@ -11,7 +11,11 @@ from app.sender import (
     SEND_BUTTONS,
     SEND_FAILURE_MARKERS,
     SEND_PENDING_MARKERS,
+    SEND_RETRY_DELAYS_MS,
+    SEND_RETRY_MARKERS,
     _await_send_terminal_state,
+    _await_send_terminal_state_with_retry,
+    _click_retry_on_latest_failed_message,
     _click_and_confirm_sticker,
     _confirm_outgoing_message,
     _confirm_sticker_sent,
@@ -489,6 +493,65 @@ def test_pending_markers_include_spin_selectors() -> None:
     assert ".semi-spin" in joined
     assert '[class*="im-saas-message-spin"]' in joined
     assert '[data-icon="spin"]' in joined
+
+
+def test_retry_markers_include_observed_douyin_selector() -> None:
+    assert '[class*="ContentSideSendStatusretry"]' in SEND_RETRY_MARKERS
+
+
+@pytest.mark.asyncio
+async def test_click_retry_waits_and_clicks_existing_failed_bubble() -> None:
+    page = MagicMock()
+    page.wait_for_timeout = AsyncMock()
+    marker = MagicMock()
+    marker.count = AsyncMock(return_value=1)
+    marker.is_visible = AsyncMock(return_value=True)
+    marker.click = AsyncMock()
+    marker_group = MagicMock(first=marker)
+    latest = MagicMock()
+    latest.locator.side_effect = (
+        lambda selector: marker_group
+        if selector == '[class*="ContentSideSendStatusretry"]'
+        else MagicMock(first=MagicMock(count=AsyncMock(return_value=0)))
+    )
+    page.locator.return_value = MagicMock(first=latest)
+
+    assert await _click_retry_on_latest_failed_message(page, 10_000) is True
+
+    page.wait_for_timeout.assert_awaited_once_with(10_000)
+    marker.click.assert_awaited_once_with(force=True)
+
+
+@pytest.mark.asyncio
+async def test_terminal_state_retries_explicit_failed_bubble(monkeypatch) -> None:
+    page = MagicMock()
+    scope = MagicMock()
+    observe = AsyncMock(
+        side_effect=[PageOperationError("文字发送失败，页面提示可以重试"), None]
+    )
+    retry = AsyncMock(return_value=True)
+    monkeypatch.setattr(sender_module, "_await_send_terminal_state", observe)
+    monkeypatch.setattr(sender_module, "_click_retry_on_latest_failed_message", retry)
+
+    await _await_send_terminal_state_with_retry(page, scope, "文字")
+
+    assert observe.await_count == 2
+    retry.assert_awaited_once_with(page, SEND_RETRY_DELAYS_MS[0])
+
+
+@pytest.mark.asyncio
+async def test_terminal_state_does_not_retry_uncertain_delivery(monkeypatch) -> None:
+    page = MagicMock()
+    scope = MagicMock()
+    observe = AsyncMock(side_effect=PageOperationError("文字发送状态未能确认"))
+    retry = AsyncMock(return_value=True)
+    monkeypatch.setattr(sender_module, "_await_send_terminal_state", observe)
+    monkeypatch.setattr(sender_module, "_click_retry_on_latest_failed_message", retry)
+
+    with pytest.raises(PageOperationError, match="状态未能确认"):
+        await _await_send_terminal_state_with_retry(page, scope, "文字")
+
+    retry.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
